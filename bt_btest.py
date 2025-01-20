@@ -15,144 +15,180 @@ from config import RUN as run_conf
 
 
 # ======================================================================
-# Create a custom data feed that includes a new “label” line
+# Create a custom data feed that includes a new "label" line
 # ======================================================================
 class PandasLabelData(bt.feeds.PandasData):
-    """
-    Extend the PandasData feed to include the 'label' column.
-    Make sure your CSV/DataFrame has a column called 'label'.
-    """
     lines = ('label',)
     params = (
-        ('datetime', None),  # use default datetime (i.e. index)
+        ('datetime', None),
         ('open', 'Open'),
         ('high', 'High'),
         ('low', 'Low'),
         ('close', 'Close'),
         ('volume', 'Volume'),
         ('openinterest', -1),
-        ('label', 'label'),  # extra line
+        ('label', 'label'),
     )
 
 
 # ======================================================================
-# Define a simple NN-based strategy
+# NN-based Strategy
 # ======================================================================
 class NNStrategy(bt.Strategy):
-    """
-    This strategy uses a pre-computed 'label' field in the data to trigger trades.
-      - If label == BUY: go long
-      - If label == SELL: exit (or go short if you want)
-      - If the price falls below stop_loss from entry, exit
-    """
-    params = (
-        ('stop_loss', 0.05),  # 5% stop loss
-    )
+    params = (('stop_loss', 0.02),)
 
     def __init__(self):
         self.order = None
         self.entryprice = None
 
     def next(self):
-        # Avoid double-ordering
         if self.order:
             return
 
-        if not self.position:  
-            # We have no open position
-            if self.data.label[0] == BUY:  # Assuming BUY=1
+        if not self.position:
+            if self.data.label[0] == BUY:
                 self.order = self.buy()
                 self.entryprice = self.data.close[0]
                 self.log(f"BUY at {self.entryprice:.2f}")
         else:
-            # We have an open position
             if self.data.low[0] < self.entryprice * (1 - self.params.stop_loss):
-                # Price dropped below stop-loss
                 self.log(f"STOP LOSS HIT at {self.data.low[0]:.2f}")
-                self.order = self.sell()  # exit the position
-            elif self.data.label[0] == SELL:  # Assuming SELL=-1
+                self.order = self.sell()
+            elif self.data.label[0] == SELL:
                 self.log(f"SELL signal at {self.data.close[0]:.2f}")
                 self.order = self.sell()
 
     def log(self, txt, dtobj=None):
-        """ Logging function for this strategy"""
         dtobj = dtobj or self.data.datetime.date(0)
         print(f"{dtobj.isoformat()} {txt}")
 
     def notify_order(self, order):
         if order.status in [order.Completed, order.Canceled, order.Margin]:
             self.order = None
+
+
+# ======================================================================
+# Simplified Buy-and-Hold Strategy
+# ======================================================================
 class BuyHoldStrategy(bt.Strategy):
     """
-    Simple Buy and Hold Strategy.
-    Buys all available capital on the first trading day and holds until the end.
+    Incremental Buy-and-Hold Strategy:
+    Buys incrementally over several bars until all capital is exhausted, then sells on the last bar.
     """
-
     def __init__(self):
-        self.first_trade_done = False
+        self.remaining_cash = None  # Track how much cash is left for incremental buys
+        self.increment_ratio = 0.1  # Buy 10% of remaining cash on each bar
+        self.buying_complete = False
 
     def next(self):
-        if not self.first_trade_done:
-            # Buy all available cash at the current price
-            self.buy(size=self.broker.get_cash() / self.data.close[0])
-            self.first_trade_done = True
+        # Initialize remaining_cash on the first bar
+        if self.remaining_cash is None:
+            self.remaining_cash = self.broker.get_cash()
+            print(f"Initial Cash: {self.remaining_cash:.2f}")
 
-def calculate_metrics(cerebro, strategy_name):
-    """
-    Calculate performance metrics for a given strategy.
-    Args:
-        cerebro: The Backtrader engine instance after running the strategy.
-        strategy_name: Name of the strategy being evaluated.
-    Returns:
-        A dictionary with Sharpe ratio, max drawdown, and annual return.
-    """
-    # Extract portfolio value over time
-    portfolio_values = cerebro.broker.get_value_dataseries()
-    returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        # Incremental buying logic
+        if not self.buying_complete:
+            # Calculate the amount to invest in this increment
+            increment_cash = self.remaining_cash * self.increment_ratio
+            size = increment_cash / self.data.close[0]
 
-    # Sharpe ratio
-    sharpe_ratio = np.mean(returns) / np.std(returns) if np.std(returns) != 0 else 0
+            # Check if there's enough cash to place a meaningful order
+            if size > 0 and self.remaining_cash > increment_cash:
+                self.buy(size=size)
+                self.remaining_cash -= increment_cash  # Deduct used cash
+                self.log(f"INCREMENTAL BUY: Size {size:.4f}, Remaining Cash: {self.remaining_cash:.2f}")
 
-    # Max drawdown
-    max_drawdown = 0
-    peak = portfolio_values[0]
-    for value in portfolio_values:
-        if value > peak:
-            peak = value
-        drawdown = (peak - value) / peak
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
+            # Stop buying if remaining cash is too low
+            if self.remaining_cash < self.data.close[0]:
+                self.buying_complete = True
+                self.log("BUYING COMPLETE: Insufficient cash for further buys.")
 
-    # Annualized return
-    total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
-    annual_return = (1 + total_return) ** (1 / (len(portfolio_values) / 252)) - 1
+        # Detect the last bar and sell all positions
+        if self.data._last():
+            if self.position:
+                self.sell(size=self.position.size)
+                self.log(f"SELL: Selling all at price {self.data.close[0]:.2f}")
+
+    def stop(self):
+        # Ensure all positions are sold at the end
+        if self.position:
+            self.sell(size=self.position.size)
+            self.log(f"STOP: Sold remaining position at price {self.data.close[0]:.2f}")
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f"BUY EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+            elif order.issell():
+                self.log(f"SELL EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log(f"Order Canceled/Margin/Rejected: {order.status}")
+
+    def log(self, txt, dtobj=None):
+        """
+        Logging function for the strategy.
+        """
+        dtobj = dtobj or self.data.datetime.date(0)
+        print(f"{dtobj.isoformat()} {txt}")
+
+
+
+# ======================================================================
+# Analyzer-based Metrics Calculation Function
+# ======================================================================
+def get_metrics_from_analyzers(cerebro_instance, strategy_instance, strategy_name):
+    final_value = cerebro_instance.broker.getvalue()
+
+    sharpe_dict = strategy_instance.analyzers.sharpe.get_analysis()
+    drawdown_dict = strategy_instance.analyzers.drawdown.get_analysis()
+    timereturn_dict = strategy_instance.analyzers.timereturn.get_analysis()
+
+    # Handle possibility that 'sharperatio' is None.
+    s = sharpe_dict.get('sharperatio', 0)
+    if s is None:
+        s = 0
+    sharpe = float(s)
+
+    max_dd_value = drawdown_dict.get('max', 0)
+    if isinstance(max_dd_value, dict):
+        max_dd_value = float(max_dd_value.get('drawdown', 0))
+    else:
+        max_dd_value = float(max_dd_value)
+    if max_dd_value < 1:
+        max_dd_pct = max_dd_value * 100
+    else:
+        max_dd_pct = max_dd_value
+
+    daily_returns = np.array(list(timereturn_dict.values()))
+    if daily_returns.size > 0:
+        avg_daily_return = np.mean(daily_returns)
+        neg_returns = daily_returns[daily_returns < 0]
+        if len(neg_returns) > 0 and np.std(neg_returns) != 0:
+            sortino_ratio = np.mean(daily_returns) / np.std(neg_returns)
+        else:
+            sortino_ratio = 0
+        annual_return = (1 + avg_daily_return) ** 252 - 1
+    else:
+        sortino_ratio = 0
+        annual_return = 0
 
     return {
         "Strategy": strategy_name,
-        "Sharpe Ratio": round(sharpe_ratio, 3),
-        "Max Drawdown (%)": round(max_drawdown * 100, 2),
+        "Sharpe Ratio": round(sharpe, 3),
+        "Sortino Ratio": round(sortino_ratio, 3),
+        "Max Drawdown (%)": round(max_dd_pct, 2),
         "Annual Return (%)": round(annual_return * 100, 2),
-        "Final Portfolio Value": round(portfolio_values[-1], 2),
+        "Final Portfolio Value": round(final_value, 2),
     }
 
+
 # ======================================================================
-# Prepare data, compute indicators, predictions, and run Cerebro
+# Main Backtest Function
 # ======================================================================
 def run_backtest():
-    # Create a Cerebro engine instance
-    cerebro = bt.Cerebro()
-
-    # Set initial capital
-    initial_capital = run_conf.get('initial_capital', 10000.0)
-    cerebro.broker.setcash(initial_capital)
-
-    # Set broker commission
-    commission_fee = run_conf.get('commission fee', 0.001)
-    cerebro.broker.setcommission(commission=commission_fee)
-
-    # ===================================================================
-    # 1. Read CSV for the full backtest range (including training portion)
-    # ===================================================================
+    # ----------------------------
+    # 1. Load & Preprocess Data
+    # ----------------------------
     full_csv = os.path.join(run_conf['folder'], 'BTCUSDT.csv')
     try:
         data = pd.read_csv(full_csv)
@@ -160,134 +196,116 @@ def run_backtest():
         print("Error loading CSV data:", ex)
         sys.exit(1)
 
-    # Convert 'Date' and sort
     data['Date'] = pd.to_datetime(data['Date'])
     data.sort_values('Date', inplace=True)
 
-    # We'll apply indicators to the entire period, then subdivide
     data = TecnicalAnalysis.compute_oscillators(data)
     data = TecnicalAnalysis.find_patterns(data)
     data = TecnicalAnalysis.add_timely_data(data)
 
-    # Filter: we only want rows between the earliest training date and the final backtest date
     train_start_dt = pd.to_datetime(run_conf['train_start'])
-    train_end_dt   = pd.to_datetime(run_conf['train_end'])
-    backtest_start = pd.to_datetime(run_conf['back_test_start'])
-    backtest_end   = pd.to_datetime(run_conf['back_test_end'])
-
-    # If your CSV has data older than train_start or newer than backtest_end, we can cut it:
-    data = data[(data['Date'] >= train_start_dt) & (data['Date'] <= backtest_end)]
-
-    if data.empty:
-        print("No data after filtering!")
-        sys.exit(1)
-
-    # ===================================================================
-    # 2. Separate the "training portion" (for fitting scaler) from the "backtest portion"
-    # ===================================================================
-    #   We'll define:
-    #   training data: [train_start_dt, train_end_dt]
-    #   backtest data: [backtest_start, backtest_end]
-    #   Possibly there's overlap or a gap.
+    train_end_dt = pd.to_datetime(run_conf['train_end'])
+    backtest_start_dt = pd.to_datetime(run_conf['back_test_start'])
+    backtest_end_dt = pd.to_datetime(run_conf['back_test_end'])
 
     train_mask = (data['Date'] >= train_start_dt) & (data['Date'] <= train_end_dt)
+    backtest_mask = (data['Date'] >= backtest_start_dt) & (data['Date'] <= backtest_end_dt)
     data_train = data[train_mask].copy()
-
-    # The "full backtest" portion covers [backtest_start, backtest_end]
-    # but we want signals for everything from backtest_start to backtest_end.
-    backtest_mask = (data['Date'] >= backtest_start) & (data['Date'] <= backtest_end)
     data_backtest = data[backtest_mask].copy()
 
-    # If you want to see how many rows are in training vs. backtest:
-    print(f"Training portion: {len(data_train)} rows")
-    print(f"Backtest portion: {len(data_backtest)} rows")
+    if data_backtest.empty:
+        print("No data available for the backtest period!")
+        sys.exit(1)
 
-    # ===================================================================
-    # 3. Fit the scaler ONLY on the training portion (data_train)
-    # ===================================================================
-    #   Create a copy for scaling and drop non-numeric columns
-    data_train_features = data_train.copy()
+    # -------------------------------
+    # 2. Fit Scaler on Training Data
+    # -------------------------------
     cols_to_drop = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Asset_name']
-    data_train_features.drop(columns=cols_to_drop, inplace=True, errors='ignore')
-
-    # Replace inf, and drop or fill any nans in training
+    data_train_features = data_train.drop(columns=cols_to_drop, errors='ignore')
     data_train_features.replace([np.inf, -np.inf], np.nan, inplace=True)
-    data_train_features.dropna(inplace=True)  # we must drop these for training
+    data_train_features.dropna(inplace=True)
 
-    # Fit scaler on training features
     scaler = StandardScaler()
-    scaler.fit(data_train_features)  # only on training subset
+    scaler.fit(data_train_features)
 
-    # ===================================================================
-    # 4. Generate predictions for the FULL backtest range
-    # ===================================================================
-    #   We'll transform data_backtest (the entire period we want signals for).
-    #   Then we apply the model to get predictions for each row.
-    # ===================================================================
-    data_backtest_features = data_backtest.copy()
-    data_backtest_features.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+    # -----------------------------------------------
+    # 3. Generate NN Predictions for Backtest Data
+    # -----------------------------------------------
+    data_backtest_features = data_backtest.drop(columns=cols_to_drop, errors='ignore')
     data_backtest_features.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # Fill missing values in the backtest portion (so we don't drop rows)
     data_backtest_features.fillna(method='ffill', inplace=True)
     data_backtest_features.fillna(method='bfill', inplace=True)
 
-    Xb = scaler.transform(data_backtest_features)  # transform backtest features
+    X_backtest = scaler.transform(data_backtest_features)
 
-    # Load your pre-trained NN model
     model_path = 'model.h5'
-    num_features = Xb.shape[1]  # must match your net input size
-    model = NNModel(num_features, 3)
-    model.load(model_path)
-
+    num_features = X_backtest.shape[1]
+    model = NNModel(num_features, 3)  # Assuming 3 classes: BUY, HOLD, SELL
     try:
-        labels = model.predict(Xb)  # predictions for the entire backtest period
+        model.load(model_path)
     except Exception as ex:
-        print("Error while predicting:", ex)
+        print(f"Error loading model from {model_path}: {ex}")
         traceback.print_exc()
         sys.exit(1)
 
-    # Convert to a Series with the same index as data_backtest
-    labels_series = pd.Series(labels, index=data_backtest.index)
-    # Now attach that to data_backtest
-    data_backtest['label'] = labels_series
+    try:
+        predictions = model.predict(X_backtest)
+    except Exception as ex:
+        print("Error during prediction:", ex)
+        traceback.print_exc()
+        sys.exit(1)
 
-    # For any rows that still have missing 'label' (should be none if we filled properly),
-    # we can fill them with HOLD
+    data_backtest['label'] = pd.Series(predictions, index=data_backtest.index)
     data_backtest['label'].fillna(HOLD, inplace=True)
-
-    # ===================================================================
-    # 5. Prepare final DataFrame for Backtrader
-    # ===================================================================
-    #   data_backtest is from backtest_start to backtest_end, with 'label'
-    # ===================================================================
     data_backtest.set_index('Date', inplace=True)
 
-    # Create a Backtrader data feed
-    bt_data = PandasLabelData(dataname=data_backtest)
+    # ----------------------------------
+    # 4. Run Strategies in Backtrader with Analyzers
+    # ----------------------------------
 
-    # Add to cerebro
-    cerebro.adddata(bt_data)
+    # --- NN-Based Strategy ---
+    cerebro_nn = bt.Cerebro()
+    cerebro_nn.broker.setcash(run_conf.get('initial_capital', 10000.0))
+    cerebro_nn.broker.setcommission(commission=run_conf.get('commission fee', 0.001))
+    bt_data_nn = PandasLabelData(dataname=data_backtest)
+    cerebro_nn.adddata(bt_data_nn)
+    cerebro_nn.addstrategy(NNStrategy, stop_loss=run_conf.get('stop_loss', 0.02))
+    cerebro_nn.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
+    cerebro_nn.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    cerebro_nn.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+    print("Running NN Strategy...")
+    strategies_nn = cerebro_nn.run()
+    strat_nn = strategies_nn[0]
+    metrics_nn = get_metrics_from_analyzers(cerebro_nn, strat_nn, "NN Strategy")
 
-    # Add our strategy
-    cerebro.addstrategy(NNStrategy, stop_loss=run_conf.get('stop_loss', 0.02))
+    # --- Buy-and-Hold Strategy ---
+    cerebro_bh = bt.Cerebro()
+    cerebro_bh.broker.setcash(run_conf.get('initial_capital', 10000.0))
+    cerebro_bh.broker.setcommission(commission=run_conf.get('commission fee', 0.001))
+    bt_data_bh = PandasLabelData(dataname=data_backtest)
+    cerebro_bh.adddata(bt_data_bh)
+    cerebro_bh.addstrategy(BuyHoldStrategy)
+    cerebro_bh.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
+    cerebro_bh.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    cerebro_bh.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+    print("Running Buy-and-Hold Strategy...")
+    strategies_bh = cerebro_bh.run()
+    strat_bh = strategies_bh[0]
+    metrics_bh = get_metrics_from_analyzers(cerebro_bh, strat_bh, "Buy-and-Hold Strategy")
 
-    # Print the timeframe we are actually using
-    print(f"Backtest data from {backtest_start.date()} to {backtest_end.date()}: {len(data_backtest)} rows")
+    # ------------------------------------------
+    # 5. Compare and Print Results
+    # ------------------------------------------
+    results = [metrics_nn, metrics_bh]
+    results_df = pd.DataFrame(results)
+    print("\nComparison of Strategies:")
+    print(results_df)
 
-    # ===================================================================
-    # 6. Run the backtest
-    # ===================================================================
-    start_val = cerebro.broker.getvalue()
-    print("Starting Portfolio Value: %.2f" % start_val)
-    cerebro.run()
-    end_val = cerebro.broker.getvalue()
-    print("Final Portfolio Value: %.2f" % end_val)
+    print("\nNN Strategy Portfolio Value:")
+    cerebro_nn.plot(iplot=True, volume=False)
 
-    # ===================================================================
-    # 7. Plot the results
-    # ===================================================================
-    cerebro.plot(iplot=True, volume=False)
+    print("\nBuy-and-Hold Strategy Portfolio Value:")
+    cerebro_bh.plot(iplot=True, volume=False)
 
 
 if __name__ == '__main__':
