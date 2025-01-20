@@ -14,6 +14,8 @@ from sklearn.preprocessing import StandardScaler
 from config import RUN as run_conf
 
 STOP_LOSS = 0.05
+LEVERAGE = 19  # For debugging, use 1 (no leverage) until orders execute reliably
+
 # ======================================================================
 # Create a custom data feed that includes a new "label" line
 # ======================================================================
@@ -32,85 +34,117 @@ class PandasLabelData(bt.feeds.PandasData):
 
 
 # ======================================================================
-# NN-based Strategy
+# NN-based Strategy (Leveraged Long-Only; no shorting)
 # ======================================================================
 class NNStrategy(bt.Strategy):
-    params = (('stop_loss', STOP_LOSS),)
+    params = (
+        ('stop_loss', STOP_LOSS),
+        ('leverage', LEVERAGE),
+    )
 
     def __init__(self):
         self.order = None
         self.entryprice = None
-
+        self.pos_size = 0.05
     def next(self):
+        # Extra debug: log current bar's date, price, and model signal.
+        current_date = self.data.datetime.date(0)
+        current_price = self.data.close[0]
+        signal = self.data.label[0]
+        self.log(f"NEXT() called - Date: {current_date}, Close: {current_price:.2f}, Signal: {signal}")
+
+        # If you suspect the model is not returning BUY, you can force it for testing:
+        # Uncomment the next line to force a BUY signal:
+        # signal = BUY
+
+        # Avoid new order if one is still pending
         if self.order:
+            self.log("An order is currently pending; skipping this bar.")
             return
 
+        # Compute the order size using leverage:
+        portfolio_value = self.broker.getvalue()
+        full_size = self.pos_size * (portfolio_value * self.p.leverage) / current_price
+        self.log(f"Calculated order size: {full_size:.4f} (Portfolio: {portfolio_value:.2f}, Leverage: {self.p.leverage})")
+
+        # If no position exists, try to open a long position when signal equals BUY.
         if not self.position:
-            if self.data.label[0] == BUY:
-                self.order = self.buy()
-                self.entryprice = self.data.close[0]
-                self.log(f"BUY at {self.entryprice:.2f}")
+            if signal == BUY:
+                self.order = self.buy(size=full_size)
+                self.entryprice = current_price
+                self.log(f"ENTER LONG (Leveraged) {full_size:.4f} at {current_price:.2f}")
+            else:
+                self.log("No BUY signal and no position; no order placed.")
         else:
-            if self.data.low[0] < self.entryprice * (1 - self.params.stop_loss):
-                self.log(f"STOP LOSS HIT at {self.data.low[0]:.2f}")
-                self.order = self.sell()
-            elif self.data.label[0] == SELL:
-                self.log(f"SELL signal at {self.data.close[0]:.2f}")
-                self.order = self.sell()
+            # A long position is open – check for stop-loss
+            if current_price < self.entryprice * (1 - self.p.stop_loss):
+                self.log(f"STOP LOSS HIT at {self.data.low[0]:.2f} (Entry: {self.entryprice:.2f})")
+                self.order = self.sell(size=self.position.size)
+            elif signal == SELL:
+                self.log(f"SELL signal received at {current_price:.2f}; exiting long position.")
+                self.order = self.sell(size=self.position.size)
+            else:
+                self.log("Holding current long position.")
 
     def log(self, txt, dtobj=None):
         dtobj = dtobj or self.data.datetime.date(0)
         print(f"{dtobj.isoformat()} {txt}")
 
     def notify_order(self, order):
-        if order.status in [order.Completed, order.Canceled, order.Margin]:
+        # Log the order status for debugging.
+        self.log(f"Order notification: {order.info if hasattr(order, 'info') else ''} Status: {order.status}")
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f"BUY EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+            elif order.issell():
+                self.log(f"SELL EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.log(f"Order Canceled/Margin/Rejected: Status {order.status}")
+            self.order = None
+        # Optionally, if your broker integration returns status '7' (expired),
+        # you may want to reset self.order here as well:
+        elif order.status == 7:
+            self.log("Order expired (status 7).")
             self.order = None
 
 
 # ======================================================================
-# Simplified Buy-and-Hold Strategy
+# Simplified Buy-and-Hold Strategy (unchanged)
 # ======================================================================
 class BuyHoldStrategy(bt.Strategy):
     """
     Incremental Buy-and-Hold Strategy:
-    Buys incrementally over several bars until all capital is exhausted, then sells on the last bar.
+    Buys incrementally over several bars until all capital is exhausted,
+    then sells on the last bar.
     """
     def __init__(self):
-        self.remaining_cash = None  # Track how much cash is left for incremental buys
-        self.increment_ratio = 0.1  # Buy 10% of remaining cash on each bar
+        self.remaining_cash = None  # Track remaining cash for incremental buys
+        self.increment_ratio = 0.01  # Buy 10% of remaining cash on each bar
         self.buying_complete = False
 
     def next(self):
-        # Initialize remaining_cash on the first bar
         if self.remaining_cash is None:
             self.remaining_cash = self.broker.get_cash()
             print(f"Initial Cash: {self.remaining_cash:.2f}")
 
-        # Incremental buying logic
         if not self.buying_complete:
-            # Calculate the amount to invest in this increment
             increment_cash = self.remaining_cash * self.increment_ratio
             size = increment_cash / self.data.close[0]
-
-            # Check if there's enough cash to place a meaningful order
             if size > 0 and self.remaining_cash > increment_cash:
                 self.buy(size=size)
-                self.remaining_cash -= increment_cash  # Deduct used cash
+                self.remaining_cash -= increment_cash
                 self.log(f"INCREMENTAL BUY: Size {size:.4f}, Remaining Cash: {self.remaining_cash:.2f}")
-
-            # Stop buying if remaining cash is too low
             if self.remaining_cash < self.data.close[0]:
                 self.buying_complete = True
                 self.log("BUYING COMPLETE: Insufficient cash for further buys.")
 
-        # Detect the last bar and sell all positions
         if self.data._last():
             if self.position:
                 self.sell(size=self.position.size)
                 self.log(f"SELL: Selling all at price {self.data.close[0]:.2f}")
 
     def stop(self):
-        # Ensure all positions are sold at the end
         if self.position:
             self.sell(size=self.position.size)
             self.log(f"STOP: Sold remaining position at price {self.data.close[0]:.2f}")
@@ -122,15 +156,11 @@ class BuyHoldStrategy(bt.Strategy):
             elif order.issell():
                 self.log(f"SELL EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log(f"Order Canceled/Margin/Rejected: {order.status}")
+            self.log(f"Order Canceled/Margin/Rejected: Status {order.status}")
 
     def log(self, txt, dtobj=None):
-        """
-        Logging function for the strategy.
-        """
         dtobj = dtobj or self.data.datetime.date(0)
         print(f"{dtobj.isoformat()} {txt}")
-
 
 
 # ======================================================================
@@ -143,7 +173,6 @@ def get_metrics_from_analyzers(cerebro_instance, strategy_instance, strategy_nam
     drawdown_dict = strategy_instance.analyzers.drawdown.get_analysis()
     timereturn_dict = strategy_instance.analyzers.timereturn.get_analysis()
 
-    # Handle possibility that 'sharperatio' is None.
     s = sharpe_dict.get('sharperatio', 0)
     if s is None:
         s = 0
@@ -154,19 +183,13 @@ def get_metrics_from_analyzers(cerebro_instance, strategy_instance, strategy_nam
         max_dd_value = float(max_dd_value.get('drawdown', 0))
     else:
         max_dd_value = float(max_dd_value)
-    if max_dd_value < 1:
-        max_dd_pct = max_dd_value * 100
-    else:
-        max_dd_pct = max_dd_value
+    max_dd_pct = max_dd_value * 100 if max_dd_value < 1 else max_dd_value
 
     daily_returns = np.array(list(timereturn_dict.values()))
     if daily_returns.size > 0:
         avg_daily_return = np.mean(daily_returns)
         neg_returns = daily_returns[daily_returns < 0]
-        if len(neg_returns) > 0 and np.std(neg_returns) != 0:
-            sortino_ratio = np.mean(daily_returns) / np.std(neg_returns)
-        else:
-            sortino_ratio = 0
+        sortino_ratio = (np.mean(daily_returns) / np.std(neg_returns)) if (len(neg_returns) > 0 and np.std(neg_returns) != 0) else 0
         annual_return = (1 + avg_daily_return) ** 252 - 1
     else:
         sortino_ratio = 0
@@ -255,6 +278,9 @@ def run_backtest():
         traceback.print_exc()
         sys.exit(1)
 
+    # Log some sample predictions for debugging
+    print("Sample predictions:", predictions[:10])
+
     data_backtest['label'] = pd.Series(predictions, index=data_backtest.index)
     data_backtest['label'].fillna(HOLD, inplace=True)
     data_backtest.set_index('Date', inplace=True)
@@ -263,20 +289,24 @@ def run_backtest():
     # 4. Run Strategies in Backtrader with Analyzers
     # ----------------------------------
 
-    # --- NN-Based Strategy ---
+    # --- NN-Based Strategy (Long-Only with Leverage) ---
     cerebro_nn = bt.Cerebro()
     cerebro_nn.broker.setcash(run_conf.get('initial_capital', 10000.0))
     cerebro_nn.broker.setcommission(commission=run_conf.get('commission fee', 0.001))
+    
+
     bt_data_nn = PandasLabelData(dataname=data_backtest)
     cerebro_nn.adddata(bt_data_nn)
-    cerebro_nn.addstrategy(NNStrategy, stop_loss=run_conf.get('stop_loss', STOP_LOSS))
+    cerebro_nn.addstrategy(NNStrategy,
+                           stop_loss=run_conf.get('stop_loss', STOP_LOSS),
+                           leverage=LEVERAGE)
     cerebro_nn.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
     cerebro_nn.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro_nn.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
-    print("Running NN Strategy...")
+    print("Running NN Strategy (Leveraged Long-Only)...")
     strategies_nn = cerebro_nn.run()
     strat_nn = strategies_nn[0]
-    metrics_nn = get_metrics_from_analyzers(cerebro_nn, strat_nn, "NN Strategy")
+    metrics_nn = get_metrics_from_analyzers(cerebro_nn, strat_nn, "NN Strategy (Leveraged Long-Only)")
 
     # --- Buy-and-Hold Strategy ---
     cerebro_bh = bt.Cerebro()
@@ -300,7 +330,7 @@ def run_backtest():
     results_df = pd.DataFrame(results)
     print("\nComparison of Strategies:")
     print(results_df)
-
+    results_df.to_csv('backtest.csv', index=False) 
     print("\nNN Strategy Portfolio Value:")
     cerebro_nn.plot(iplot=True, volume=False)
 
