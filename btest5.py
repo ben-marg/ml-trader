@@ -20,7 +20,7 @@ from config import RUN as run_conf
 # Constants and Configuration
 # ================================
 STOP_LOSS = 0.05
-LEVERAGE = 10  # Adjust leverage as needed
+LEVERAGE = 15  # Adjust leverage as needed
 BUFFER_SIZE = 100  # Adjust based on maximum lookback required for feature computation
 
 # ================================
@@ -407,7 +407,7 @@ def run_backtest():
     cerebro_bh.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
     cerebro_bh.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro_bh.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
-
+    
     # Run strategies
     print("\nRunning NN Strategy (On-the-Fly Predictions)...")
     try:
