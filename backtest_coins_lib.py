@@ -278,7 +278,7 @@ def calc_cum_ret_s2(x, stop_loss, fee):
 
 
 
-def backtest_single_coin(RUN, filename, mdl_name="model.h5", suffix=""):
+def backtest_single_coin(RUN, filename, mdl_name=r'model.h5', suffix=""):
     """
     Backtest a coin whose timeseries is contained in filename.
     It uses last model trained.
@@ -331,6 +331,7 @@ def backtest_single_coin(RUN, filename, mdl_name="model.h5", suffix=""):
         model.load(mdl_name)
         labels = model.predict(Xs)
         data['label'] = labels
+        print(labels)
         hist_nn, cap_nn, num_op_nn, min_drawdown_nn, max_gain_nn, g_ops_nn = calc_cum_ret_s1(data, RUN['stop_loss'], RUN['commission fee'])
         
         
@@ -489,4 +490,4 @@ def backtest_all_coins(RUN):
 
 
 if __name__ == "__main__":
-    backtest_single_coin(run_conf, 'BTCUSDT.csv')
+    backtest_single_coin(run_conf, 'ETHUSDT.csv')

@@ -1,350 +1,322 @@
-import ccxt
-import time
-import pandas as pd
-import numpy as np
-import datetime as dt
-import traceback, sys
-import logging
-from copy import deepcopy
-from config import RUN as run_conf
-from NNModel_lib import NNModel  
-from technical_analysis_lib import TecnicalAnalysis, BUY, HOLD, SELL
-from sklearn.preprocessing import StandardScaler
-import compute_indicators_labels_lib  # for get_dataset and feature functions
+#!/usr/bin/env python
+import os
+import sys
 import json
+import traceback
+import time
+import numpy as np
+import pandas as pd
+import backtrader as bt
+import ccxt
+import logging
+import pickle
+from sklearn.preprocessing import StandardScaler
 
+# ------------------------------
+# Logging Configuration
+# ------------------------------
+logger = logging.getLogger('my_logger')
+logger.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler('app.log')
+file_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
-# ----------------------------------------------------------------------------
-# Logging configuration
-# ----------------------------------------------------------------------------
-logging.basicConfig(
-    filename="live_trading_bot.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
+# ------------------------------
+# Strategy Signal Labels and Parameters
+# ------------------------------
+STOP_LOSS = 0.05
+BUY_SIGNAL = 1
+HOLD_SIGNAL = 0
+SELL_SIGNAL = -1
 
-# ----------------------------------------------------------------------------
-# Configuration Setup
-# ----------------------------------------------------------------------------
-# For live trading, we use a copy of your RUN configuration.
-live_conf = deepcopy(run_conf)
-live_conf['b_window'] = 2   # backward/look-back window (same as used in training/backtest)
-live_conf['f_window'] = 2   # forward window (forecast horizon)
-# Open and load the JSON file
+# ------------------------------
+# Load API Keys from keys.json
+# ------------------------------
 with open('keys.json', 'r') as file:
     credentials = json.load(file)
-# Binance API credentials
 
-binance_api_key = live_conf.get('binance_api_key', credentials.get("binance-api-key"))
-binance_secret  = live_conf.get('binance_secret', credentials.get("secret"))
-# (trade_amount is no longer a fixed value; see compute_order_size below.)
-# Model file (should match the naming/format you used during training)
-model_file = live_conf.get("model_file", "./models/model.h5")
-
-# ----------------------------------------------------------------------------
-# Connect to Binance via CCXT
-# ----------------------------------------------------------------------------
-exchange = ccxt.binance({
-    'apiKey': binance_api_key,
-    'secret': binance_secret,
+# ------------------------------
+# Create a CCXT Binance Exchange Instance (Testnet)
+# ------------------------------
+binance_config = {
+    'apiKey': credentials.get("testnet-key"),
+    'secret': credentials.get("testnet-secret"),
     'enableRateLimit': True,
-})
+    'options': {'defaultType': 'future'},
+    'test': True,
+}
 
-# ----------------------------------------------------------------------------
-# Prepare the Feature Scaler
-# ----------------------------------------------------------------------------
+exchange = ccxt.binance(binance_config)
+exchange.set_sandbox_mode(True)
+
+# ------------------------------
+# Example: Fetch and Print USDT Balance Using CCXT
+# ------------------------------
 try:
-    scaler = StandardScaler()
-    dataset = compute_indicators_labels_lib.get_dataset(live_conf)
-    dataset.replace([np.inf, -np.inf], np.nan, inplace=True)
-    dataset = dataset.dropna()
-    dataset['Date'] = pd.to_datetime(dataset['Date'])
-    dataset = dataset[dataset['pct_change'] < live_conf['beta']]  # remove outliers
-    print(dataset['label'].value_counts())
-    labels = dataset['label'].copy()
-    dataset.drop(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', "Asset_name", "label"], inplace=True)
-    columns = dataset.columns
-    index = dataset.index
-    X_scaler = scaler.fit_transform(dataset.values)
-    dataset = pd.DataFrame(X_scaler, columns=columns, index=index)
-    dataset['label'] = labels
-    training_feature_cols = list(columns)
-    logging.info("Scaler fitted on historical dataset. Training feature columns: %s", training_feature_cols)
+    balance = exchange.fetch_balance()
+    usdt_balance = balance.get('USDT', {})
+    if usdt_balance:
+        print("USDT Balance:")
+        print(usdt_balance)  # e.g., {'free': 15000.0, 'used': 0.0, 'total': 15000.0}
+    
+    else:
+        print("USDT balance not found in the response.")
 except Exception as e:
-    logging.error(f"Error fitting scaler: {e}")
-    sys.exit(1)
+    logger.error("Error fetching balance: %s", e)
 
-# ----------------------------------------------------------------------------
-# Load the Trained Neural Network Model
-# ----------------------------------------------------------------------------
-input_dim = X_scaler.shape[1]
-model_instance = NNModel(input_dim, 3)
-try:
-    # For dummy training, split a bit of historical data:
-    from sklearn.model_selection import train_test_split
-    X_total = scaler.transform(dataset.iloc[:, :-1])
-    y_total = dataset.iloc[:, -1].values
-    X_train, X_test, y_train, y_test = train_test_split(X_total, y_total, test_size=0.3, random_state=42)
-    model_instance.dummy_train(X_train, y_train)
-    # Now load your pre-trained model weights
-    model_instance.load(model_file)
-    logging.info(f"Model loaded from {model_file}.")
-except Exception as e:
-    logging.error(f"Error loading model: {e}")
-    sys.exit(1)
-
-# ----------------------------------------------------------------------------
-# Trading State Variables
-# ----------------------------------------------------------------------------
-# Track current position side ('long' or 'short'), current position size (in base asset units),
-# and the capital percentage allocated (each order uses 2%, maximum allocation is 20%)
-position = None            # None, 'long', or 'short'
-contract_amount = 0.0      # total contracts / amount in current position
-allocated_percent = 0.0    # in percent (each order adds 2% and maximum allowed is 20%)
-
-# ----------------------------------------------------------------------------
-# Data Fetching & Processing Functions
-# ----------------------------------------------------------------------------
-def fetch_live_data(symbol='BTCUSDT', timeframe='1m', limit=100):
+# ------------------------------
+# Custom CCXT Data Feed for Backtrader
+# ------------------------------
+class CustomCCXTFeed(bt.feed.DataBase):
     """
-    Fetch recent OHLCV data from Binance.
+    A custom live data feed that uses CCXT to fetch OHLCV data from Binance Testnet.
     """
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.drop(columns=['timestamp'], inplace=True)
-        return df
-    except Exception as e:
-        logging.error(f"Error fetching live data: {e}")
-        return None
+    params = (
+        ('exchange', None),         # a ccxt exchange instance
+        ('symbol', 'BTC/USDT'),
+        ('timeframe', bt.TimeFrame.Minutes),  # Backtrader's timeframe (integer constant)
+        ('compression', 240),         # 1-minute candles
+        ('since', None),            # starting timestamp in ms (if None, computed)
+        ('limit', 100),             # number of candles to fetch per call
+        ('sleep', 1),               # seconds to sleep if no new data
+    )
 
-def process_live_data(df):
-    """
-    Process live OHLCV data to match the training feature set.
-    """
-    try:
-        df_proc = df.copy()
-        df_proc = TecnicalAnalysis.compute_oscillators(df_proc)
-        df_proc = TecnicalAnalysis.find_patterns(df_proc)
-        df_proc = TecnicalAnalysis.add_timely_data(df_proc)
-        df_proc.set_index('Date', inplace=True)
-        df_proc.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df_proc.dropna(inplace=True)
-        df_features = df_proc.copy()
-        cols_to_drop = ['High', 'Low', 'Close', 'Volume', 'Asset_name', 'label']
-        for col in cols_to_drop:
-            if col in df_features.columns:
-                df_features = df_features.drop(columns=[col])
-        live_feature_cols = list(df_features.columns)
-        logging.info("Live feature columns before adjustment: %s", live_feature_cols)
-        extra_cols = [col for col in live_feature_cols if col not in training_feature_cols]
-        if extra_cols:
-            logging.info("Dropping extra columns from live data: %s", extra_cols)
-            df_features = df_features.drop(columns=extra_cols)
-        missing_cols = [col for col in training_feature_cols if col not in df_features.columns]
-        if missing_cols:
-            logging.warning("Live data is missing expected training columns: %s", missing_cols)
-        logging.info("Final live feature columns: %s", list(df_features.columns))
-        return df_proc, df_features
-    except Exception as e:
-        logging.error(f"Error processing live data: {e}")
-        return None, None
+    # Mapping from Backtrader timeframe constants to CCXT timeframe strings
+    TIMEFRAME_MAP = {
+        bt.TimeFrame.Seconds: '1s',
+        bt.TimeFrame.Minutes: '1m',
+        bt.TimeFrame.Days: '1d',
+        bt.TimeFrame.Weeks: '1w',
+        bt.TimeFrame.Months: '1M'
+    }
 
-# ----------------------------------------------------------------------------
-# Capital & Order Size Calculation
-# ----------------------------------------------------------------------------
-def compute_order_size(symbol='BTCUSDT'):
-    """
-    Calculate the order size based on 2% of the total available capital in USDT.
-    Assumes that the balance is denominated in USDT.
-    """
-    try:
-        balance = exchange.fetch_balance()
-        # Depending on your account structure, adjust where you look up your total balance.
-        total_capital = balance['total']['USDT']  # total USDT balance
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = ticker['last']
-        # Order value = 2% of total capital. Then compute order size (in base asset units).
-        order_value = total_capital * 0.02
-        order_amount = order_value / current_price
-        return order_amount, total_capital, current_price
-    except Exception as e:
-        logging.error(f"Error computing order size: {e}")
-        return None, None, None
+    def __init__(self):
+        super().__init__()
+        if self.p.since is None:
+            # Set "since" to a little before now
+            self.p.since = self.p.exchange.milliseconds() - self.p.limit * 60 * 1000
+        self._data_buffer = []
 
-# ----------------------------------------------------------------------------
-# Trading Decision Function
-# ----------------------------------------------------------------------------
-def decide_trade(predicted_label, current_position, allocated_percent):
-    """
-    Decision logic:
-      - If the signal is BUY:
-            * If no position, then open a long ('buy').
-            * If already long and allocated capital is less than 20%, then add to long ('buy').
-            * If in a short position, then reverse to long ('reverse_to_long').
-      - If the signal is SELL:
-            * If no position, then open a short ('sell').
-            * If already short and allocated capital is less than 20%, then add to short ('sell').
-            * If in a long position, then reverse to short ('reverse_to_short').
-      - Otherwise, hold.
-    """
-    if predicted_label == BUY:
-        if current_position is None:
-            return 'buy'
-        elif current_position == 'long':
-            if allocated_percent < 20:
-                return 'buy'  # add to long position (scale in)
-            else:
-                return 'hold'
-        elif current_position == 'short':
-            return 'reverse_to_long'
-    elif predicted_label == SELL:
-        if current_position is None:
-            return 'sell'
-        elif current_position == 'short':
-            if allocated_percent < 20:
-                return 'sell'  # add to short position (scale in)
-            else:
-                return 'hold'
-        elif current_position == 'long':
-            return 'reverse_to_short'
-    return 'hold'
+    def _load(self):
+        # If buffer is empty, fetch new OHLCV data
+        if not self._data_buffer:
+            try:
+                # Convert Backtrader timeframe to CCXT timeframe string
+                ccxt_timeframe = self.TIMEFRAME_MAP.get(self.p.timeframe, '4h')
+                ohlcv = self.p.exchange.fetch_ohlcv(
+                    self.p.symbol,
+                    timeframe=ccxt_timeframe,
+                    since=self.p.since,
+                    limit=self.p.limit
+                )
+                if ohlcv:
+                    self.p.since = ohlcv[-1][0] + 1
+                    self._data_buffer.extend(ohlcv)
+                else:
+                    time.sleep(self.p.sleep)
+                    return None
+            except Exception as e:
+                logger.error("Error fetching data from CCXT: %s", e)
+                time.sleep(self.p.sleep)
+                return None
 
-# ----------------------------------------------------------------------------
-# Trade Execution Function
-# ----------------------------------------------------------------------------
-def execute_trade(action, symbol='BTCUSDT'):
-    """
-    Execute the specified action. Actions:
-      - 'buy': Open or add to a long position.
-      - 'sell': Open or add to a short position.
-      - 'reverse_to_long': Reverse a short position to long.
-      - 'reverse_to_short': Reverse a long position to short.
-    Each order uses 2% of total capital. If adding, ensure total allocated capital does not exceed 20%.
-    """
-    global position, allocated_percent, contract_amount
+        if self._data_buffer:
+            # Pop one candle from the buffer:
+            candle = self._data_buffer.pop(0)
+            # CCXT returns: [timestamp, open, high, low, close, volume]
+            # Convert timestamp (in ms) to a float datetime for backtrader:
+            dt = bt.date2num(pd.to_datetime(candle[0], unit='ms'))
+            self.lines.datetime[0] = dt
+            self.lines.open[0] = candle[1]
+            self.lines.high[0] = candle[2]
+            self.lines.low[0] = candle[3]
+            self.lines.close[0] = candle[4]
+            self.lines.volume[0] = candle[5]
+            return True
+        return False
 
-    try:
-        order_amount, total_capital, current_price = compute_order_size(symbol)
-        if order_amount is None:
-            return None
+# ------------------------------
+# Live Trading Strategy with Model-Based Labeling
+# ------------------------------
+# (Ensure that technical_analysis_lib and NNModel_lib are available in your PYTHONPATH)
+from technical_analysis_lib import TecnicalAnalysis, BUY, HOLD, SELL
+from NNModel_lib import NNModel
 
-        # The capital allocation per order is fixed at 2% (i.e. allocated_percent increases by 2 with each order)
-        if action == 'buy':
-            order = exchange.create_market_buy_order(symbol, order_amount)
-            logging.info(f"Executed BUY order for {order_amount} {symbol} (long)")
-            if position is None:
-                position = 'long'
-            allocated_percent += 2
-            contract_amount += order_amount
-            return order
+class LiveNNStrategy(bt.Strategy):
+    params = (
+        ('stop_loss', STOP_LOSS),
+        ('window', 5),  # Number of bars to accumulate before feature computation
+    )
 
-        elif action == 'sell':
-            order = exchange.create_market_sell_order(symbol, order_amount)
-            logging.info(f"Executed SELL order for {order_amount} {symbol} (short)")
-            if position is None:
-                position = 'short'
-            allocated_percent += 2
-            contract_amount += order_amount
-            return order
+    def __init__(self):
+        self.order = None
+        self.entryprice = None
+        self.live_data = []
+        self.last_bar_time = None
 
-        elif action == 'reverse_to_long':
-            # Close the short position first
-            close_order = exchange.create_market_buy_order(symbol, contract_amount)
-            logging.info(f"Closed SHORT position by buying {contract_amount} {symbol}")
-            # Reset allocated capital and position variables
-            allocated_percent = 0
-            contract_amount = 0
-            # Now open a long order
-            new_order = exchange.create_market_buy_order(symbol, order_amount)
-            logging.info(f"Reversed to LONG: executed BUY order for {order_amount} {symbol}")
-            position = 'long'
-            allocated_percent = 2
-            contract_amount = order_amount
-            return new_order
+        self.position_size = 0.05
+        self.leverage = 10
+        self.stop_loss = 0.05 
 
-        elif action == 'reverse_to_short':
-            # Close the long position first
-            close_order = exchange.create_market_sell_order(symbol, contract_amount)
-            logging.info(f"Closed LONG position by selling {contract_amount} {symbol}")
-            allocated_percent = 0
-            contract_amount = 0
-            # Now open a short order
-            new_order = exchange.create_market_sell_order(symbol, order_amount)
-            logging.info(f"Reversed to SHORT: executed SELL order for {order_amount} {symbol}")
-            position = 'short'
-            allocated_percent = 2
-            contract_amount = order_amount
-            return new_order
-
-        else:
-            logging.info("Hold decision: no trade executed.")
-            return None
-
-    except Exception as e:
-        logging.error(f"Error executing trade: {e}")
-        return None
-
-# ----------------------------------------------------------------------------
-# Main Live Trading Loop
-# ----------------------------------------------------------------------------
-def live_trading_loop():
-    global position, allocated_percent, contract_amount
-
-    symbol = 'BTCUSDT'
-    timeframe = '4h'
-    fetch_limit = 100  # number of recent candles
-
-    while True:
+        # Load the scaler (assumed to be saved as scaler.pkl)
         try:
-            # 1. Fetch live data
-            df_live = fetch_live_data(symbol, timeframe, fetch_limit)
-            if df_live is None or df_live.empty:
-                logging.warning("No live data fetched; skipping cycle.")
-                time.sleep(60)
-                continue
+            with open('scaler.pkl', 'rb') as f:
+                self.scaler = pickle.load(f)
+        except Exception as ex:
+            logger.info(f"Error loading scaler: {ex}")
+            sys.exit(1)
+        
+        self.num_features = 36  # Adjust as necessary
 
-            # 2. Process the live data
-            full_data, df_features = process_live_data(df_live)
-            if df_features is None or df_features.empty:
-                logging.warning("No processed data available; skipping cycle.")
-                time.sleep(60)
-                continue
+        # Load the neural network model (NNModel)
+        try:
+            self.model = NNModel(self.num_features, 3)  # assuming 3 classes: BUY, HOLD, SELL
+            self.model.load('model.h5')
+        except Exception as ex:
+            logger.info(f"Error loading NN model: {ex}")
+            traceback.print_exc()
+            sys.exit(1)
 
-            # 3. Scale the features for prediction
-            X_live = scaler.transform(df_features)
-            X_live_input = X_live[-1].reshape(1, -1)
+    def next(self):
+        # Avoid processing a new bar if there is a pending order.
+        if self.order:
+            logger.info("Pending order exists; skipping new order placement.")
+            return
 
-            # 4. Predict using your NN model
-            predicted_label = model_instance.predict(X_live_input)
-            logging.info(f"Model predicted label: {predicted_label}")
+        current_time = self.data.datetime.datetime(0)
+        if self.last_bar_time is not None and current_time <= self.last_bar_time:
+            logger.info(f"Duplicate or outdated bar at {current_time}; last_bar_time: {self.last_bar_time}")
+            return
+        self.last_bar_time = current_time
+        logger.info(f"Processing new bar at {current_time}")
 
-            # 5. Decide trade action using the new logic
-            action = decide_trade(predicted_label, position, allocated_percent)
-            logging.info(f"Decided action: {action}")
+        # Accumulate live data
+        bar = {
+            'Date': current_time,
+            'Open': self.data.open[0],
+            'High': self.data.high[0],
+            'Low': self.data.low[0],
+            'Close': self.data.close[0],
+            'Volume': self.data.volume[0]
+        }
+        self.live_data.append(bar)
+        if len(self.live_data) > self.params.window:
+            self.live_data = self.live_data[-self.params.window:]
+        logger.info(f"Sliding window size after update: {len(self.live_data)}")
+        if len(self.live_data) < self.params.window:
+            logger.info("Insufficient data to compute features; waiting for more bars")
+            return
 
-            # 6. Execute trade if required
-            if action in ['buy', 'sell', 'reverse_to_long', 'reverse_to_short']:
-                order = execute_trade(action, symbol)
-                if order is not None:
-                    logging.info(f"Order executed: {order}")
+        # Prepare features and predict model label
+        df = pd.DataFrame(self.live_data)
+        try:
+            df = TecnicalAnalysis.compute_oscillators(df)
+            df = TecnicalAnalysis.find_patterns(df)
+            df = TecnicalAnalysis.add_timely_data(df)
+        except Exception as ex:
+            logger.info(f"Error computing technical indicators: {ex}")
+            return
+
+        cols_to_drop = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Asset_name']
+        feature_df = df.drop(columns=cols_to_drop, errors='ignore')
+        feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        feature_df.ffill()
+
+        try:
+            features = feature_df.iloc[-1].values.reshape(1, -1)
+            logger.info(f"Features: {features}")
+        except Exception as ex:
+            logger.info(f"Error preparing feature vector: {ex}")
+            return
+
+        try:
+            scaled_features = self.scaler.transform(features)
+            logger.info(f"Scaled features: {scaled_features}")
+        except Exception as ex:
+            logger.info(f"Error scaling feature vector: {ex}")
+            return
+
+        try:
+            prediction = self.model.predict(scaled_features)
+            logger.info(f"Model prediction: {prediction}")
+            label = prediction[0]
+        except Exception as ex:
+            logger.info(f"Error during model prediction: {ex}")
+            return
+
+        # Calculate order size and check execution conditions
+        current_price = self.data.close[0]
+        portfolio_value = self.broker.getvalue()
+        logger.info(f"Portfolio Value: {portfolio_value}")
+        free_cash = self.broker.get_cash()
+        logger.info(f"Free cash: {free_cash}")
+
+        full_size = (portfolio_value * self.leverage) / current_price
+        full_size *= self.position_size
+        logger.info(f"Calculated order size: {full_size:.4f} (Portfolio: {portfolio_value:.2f}, Leverage: {self.leverage})")
+        cash_required = full_size * current_price
+        logger.info(f"Cash required: {cash_required}")
+        # Place a market order (this will now only be called if no order is pending)
+        try:
+            if (free_cash > cash_required):
+                self.order = self.buy(exectype=bt.Order.Market, size=full_size)
+                self.entryprice = current_price
+                logger.info(f"ENTER LONG (Leveraged) {full_size:.4f} at {current_price:.2f}")
             else:
-                logging.info("Holding current position.")
-
-            # Log current price and position state for reference
-            current_price = float(df_live['Close'].iloc[-1])
-            logging.info(f"Current price: {current_price}, Position: {position}, Allocated Capital: {allocated_percent}%")
-            time.sleep(60)
-
+                logger.info("Insufficient cash to execute the order")
+            
         except Exception as e:
-            logging.error(f"Exception in trading loop: {e}")
-            traceback.print_exc(file=sys.stdout)
-            time.sleep(60)
+            logger.error(f"Order submission error: {e}")
 
-# ----------------------------------------------------------------------------
-# Entry Point
-# ----------------------------------------------------------------------------
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                logger.info(f"BUY EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+            elif order.issell():
+                logger.info(f"SELL EXECUTED: Price {order.executed.price:.2f}, Size {order.executed.size}")
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            logger.info(f"Order Canceled/Margin/Rejected: {order.status}")
+            print(order)
+            input()
+            self.order = None
+        # Handle custom "Expired" status if it occurs (assume status value 7 means expired)
+        elif hasattr(order, 'status') and order.status == 7:
+            logger.info("Order expired (status 7). Resetting order state.")
+            self.order = None
+    def stop(self):
+        print("end of strategy")
+        
+    
+
+# ------------------------------
+# Run Live Trading with CCXT Data Feed
+# ------------------------------
+def run_live_trading():
+    try:
+        cerebro = bt.Cerebro()
+        # Use a 1-minute timeframe with compression 1 for the CCXT feed.
+        data = CustomCCXTFeed(
+            exchange=exchange,
+            symbol='BTC/USDT',
+            timeframe=bt.TimeFrame.Minutes,
+            compression=240,
+            limit=100
+        )
+        cerebro.adddata(data)
+        cerebro.addstrategy(LiveNNStrategy)
+        
+        free_balance = usdt_balance.get('free')
+        print(free_balance)
+        cerebro.broker.setcash(free_balance)  # starting cash
+        logger.info("Starting live trading...")
+        cerebro.run()
+        cerebro.plot()
+    except Exception as ex:
+        print(f"Error in live trading: {ex}")
+        traceback.print_exc()
+
 if __name__ == "__main__":
-    logging.info("Starting live trading bot...")
-    live_trading_loop()
+    run_live_trading()

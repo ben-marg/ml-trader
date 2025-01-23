@@ -1,0 +1,3 @@
+Strategy,Sharpe Ratio,Max Drawdown (%),Annualized Return (%),Final Portfolio Value
+LiveNNStrategy,,"AutoOrderedDict({'len': 0.0, 'drawdown': 0.0, 'moneydown': 0.0})",0.0,10000.0
+Buy and Hold,0.7236481539316215,"AutoOrderedDict({'len': 6553, 'drawdown': 73.67890391975824, 'moneydown': 68753.9054378009})",43.039135818939435,133611.4085855186

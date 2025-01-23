@@ -18,9 +18,10 @@ run1 = {
     # used in define the grid for searching backward and forward window
     'b_lim_sup_window': 6,
     'f_lim_sup_window': 6,
-    
-    'back_test_start': Timestamp("2022-01-1"),
-    'back_test_end': Timestamp("2022-03-31"),
+    'train_start' : Timestamp("2010-01-1"),
+    'train_end': Timestamp("2021-01-1"),
+    'back_test_start': Timestamp("2010-01-1"),
+    'back_test_end': Timestamp("2025-03-31"),
     'suffix':  'ncr',
 
     'stop_loss': 0.05,
