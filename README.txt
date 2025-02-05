@@ -17,6 +17,7 @@ The main conclusions of the study are:
 1. The current testing framework leads to severe overfitting. That is, the model performs exceptionally well on the training data, but exceptionally poorly on the test data.
 2. The model has the potential for good performance, but needs some significant changes 
 3. Integrating a testing pipeline with Backtrader directly will lead to much better results.
+4. The number of technical indicators used was excessive, and only made overfitting more of an issue. It is best to limit the number of indiactors used to avoid overfitting and unneeded complexity. 
 
 For that reason, this code was open-sourced. If any progress is made or anyone has any feedback, feel free to reach out to me  at beniamarg3@gmail.com. I have been working on some of the ideas developed in this study, and they have shown significant promise. 
 
