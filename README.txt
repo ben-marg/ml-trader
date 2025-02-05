@@ -1,57 +1,24 @@
-The software has ben developed on Linux.
-The code can run with a standard Python interpreter.
-However, it is strongly encouraged the use of
-a working installation of Tensorflow *on CUDA GPU*.
+This code has been adapted from the below research paper:
 
-Python Package Prerequisites
-------------
-Numpy: numpy.org
-SkLearn: scikit-learn.org
-matplotlib: matplotlib.org 
-Tensorflow: tensorflow.org 
-Shap: github.com/slundberg/shap 
-Binance api: github.com/binance/binance-connector-python
+https://www.sciencedirect.com/science/article/pii/S0957417423023084?via%3Dihub
+
+This code is a thorough exploration of all the topics discussed in the paper, as well as an attempt at practical implementation. 
+The following changes/developments were made:
+
+1. Library upgrades/modernization
+2. Backtesting strategy with Backtrader
+3. Thorough testing with unseen data
+4. A framework for a live implementation via Binance Futures.
 
 
-Folders
--------
-root folder: contains outputs from NN training and shap explanations.
-reports/: contains all script outputs. 
-rep_charts_paper/: contains figure, tables, etc. reported in the article
-processed_data/: contains the preprocessed dataset with all the labeling schemes applied
-raw_data_4_hour/: contains the raw datasets downloaded from binance API endpoint
+
+The main conclusions of the study are:
+
+1. The current testing framework leads to severe overfitting. That is, the model performs exceptionally well on the training data, but exceptionally poorly on the test data.
+2. The model has the potential for good performance, but needs some significant changes 
+3. Integrating a testing pipeline with Backtrader directly will lead to much better results.
+
+For that reason, this code was open-sourced. If any progress is made or anyone has any feedback, feel free to reach out to me  at beniamarg3@gmail.com. I have been working on some of the ideas developed in this study, and they have shown significant promise. 
 
 
-Running the pipeline
---------------------
-The pipeline code is constituted by a series of scripts to run in sequence.
 
-- config.py: script configurations.
-
-- run_download_data.py: to be updated with own Binance api key and secret key.
-    	Creates the raw set of cryptos into the folder asset_data/raw_data_4_hour/
-
-- run_preprocess_dataset.py: 
-	Creates the preprocessed dataset and saves it into a csv file in the folder processed_data/
-
-- run_data_stats.py:
-	 Plots the charts of time data distribution.
-
-- run_alpha_beta.py: 
-	Computes alpha and beta, (the computed values must be copied and pasted into config.py).
-
-- run_search_bw_fw.py: 
-	The grid search for backward and forward windows. The output is saved into the file reports/final_ncr_1.xlsx
-
-- run_train_final.py:
-	The training of the five final models. The output saves reports into reports/final_model_*_*.xlsx. 
-	One file for each backward/forward window combination.
-
-- run_backtest_final.py:
-	The backtest of the above five models and saves reports into reports/backtest_final.xlsx.
-    
-- run_shap_explainer.py:
-	Creates and serializes on disk the SHAP explanation object.
-
-- run_shap_chart.py:
-	Draws all shap charts.
