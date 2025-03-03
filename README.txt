@@ -40,7 +40,7 @@ To summarize:
 
 Changing the time period of the testing will result in different results. It is critical to study the effects of overfitting by fitting the model on all but the last N% of the data, where N can range from 10-30%. Doing so will reveal incrdible performance during the training period, but dismal performance during the testing period. 
 
-3. Use livetradev3.py as a template for a live trading implementation with Binance. Be sure to provide your own API keys in a JSON file called secrets.json that is in your repository directory. 
+3. Use the live trading files as a template for a live trading implementation with Binance. Be sure to provide your own API keys in a JSON file called secrets.json that is in your repository directory. 
 
 
 
