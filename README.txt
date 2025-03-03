@@ -27,11 +27,22 @@ ______________________________________________________________
 USE INSTRUCTIONS:
 
 1. Follow the instructions in the original paper to train/test the model, except by sure to ommit the last 2-3 years of data to save for testing. 
+To summarize:
+
+1. Download the data with the data download script:  run_download_data.py 
+2. Process the indicators and other features by using: run_preprocess_dataset.py 
+2. Calculate the correct values of alpha and beta : run_alpha_beta.py 
+3. Optimize the hyperparamters using : run_search_bw_fw.py 
+4. Use backtest_coins_lib.py to run an initial backtest. Note that you may have to modify the main function to run it on the correct coin
 
 
 2. Run btest, btest2, ... btest4 to view the backtesting results of the strategy. 
 
 Changing the time period of the testing will result in different results. It is critical to study the effects of overfitting by fitting the model on all but the last N% of the data, where N can range from 10-30%. Doing so will reveal incrdible performance during the training period, but dismal performance during the testing period. 
+
+3. Use livetradev3.py as a template for a live trading implementation with Binance. Be sure to provide your own API keys in a JSON file called secrets.json that is in your repository directory. 
+
+
 
 POTENTIAL FIXES:
 
